@@ -1,0 +1,12 @@
+{
+  "instanceName": "x8ki-letl-twmt",
+  "workspaceName": "twilleke",
+  "workspaceId": 128864,
+  "branch": "v1",
+  "paths": {
+    "functions": "functions",
+    "tables": "tables",
+    "apis": "apis",
+    "tasks": "tasks"
+  }
+}
