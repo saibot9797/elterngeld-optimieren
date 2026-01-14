@@ -881,12 +881,17 @@ Sozialabgaben = Einkommen × (9% KV/PV + 10% RV + 2% AV)
 
 ```
 Rate =
-    100% - (Einkommen - 1000) × 0,05%   wenn Einkommen < 1000
+    67% + (1000 - Einkommen) × 0,05%    wenn Einkommen < 1000  (max 100%)
     67%                                  wenn 1000 ≤ Einkommen ≤ 1200
-    67% - (Einkommen - 1200) × 0,05%    wenn Einkommen > 1200
+    67% - (Einkommen - 1200) × 0,05%    wenn Einkommen > 1200  (min 65%)
 
 // Grenzen:
 65% ≤ Rate ≤ 100%
+
+// Beispiele:
+//   800 € → 67% + (1000-800) × 0,05% = 67% + 10% = 77%
+//  1100 € → 67%
+//  2000 € → 67% - (2000-1200) × 0,05% = 67% - 40% = 27% → MIN greift → 65%
 ```
 
 ### 19.3 Elterngeld
@@ -1066,6 +1071,509 @@ Vergleich über 12 Monate:
 - [ ] Partnerschaftsbonus-Option prüfen
 - [ ] Mutterschaftsgeld-Anrechnung beachten
 - [ ] Gleichzeitigen Bezug planen (falls erlaubt)
+
+---
+
+## Anhang D: Backend-Implementierungsreferenz
+
+### D.1 Vollständiger Berechnungsalgorithmus (Pseudocode)
+
+```javascript
+/**
+ * BEEG-KONFORME ELTERNGELD-BERECHNUNG
+ * Basierend auf BEEG in der Fassung vom 22.12.2025
+ */
+
+function berechneElterngeld(person, geburtsdatum, istAlleinerziehend) {
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 1: ANSPRUCHSPRÜFUNG (§1)
+  // ═══════════════════════════════════════════════════════════
+
+  // 1.1 Einkommensgrenze prüfen (§1 Abs. 8)
+  const einkommensgrenze = ermittleEinkommensgrenze(geburtsdatum);
+  if (person.zvE > einkommensgrenze) {
+    return { anspruch: false, grund: "Einkommensgrenze überschritten" };
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 2: BEMESSUNGSZEITRAUM (§2b)
+  // ═══════════════════════════════════════════════════════════
+
+  let bemessungsende;
+  if (person.rolle === 'mutter') {
+    // Mutter: 12 Monate vor Mutterschutzfrist
+    const mutterschutzBeginn = addDays(geburtsdatum, -42); // 6 Wochen vor ET
+    bemessungsende = addMonths(mutterschutzBeginn, -1);
+  } else {
+    // Partner: 12 Monate vor Geburt
+    bemessungsende = addMonths(geburtsdatum, -1);
+  }
+  const bemessungsbeginn = addMonths(bemessungsende, -11);
+
+  // 2.1 Ausklammerbare Monate verschieben (§2b Abs. 1 Satz 2)
+  const effektiverZeitraum = verschiebeMonate(
+    bemessungsbeginn,
+    bemessungsende,
+    person.ausklammerbareMonat
+  );
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 3: BRUTTOEINKOMMEN ERMITTELN (§2c, §2d)
+  // ═══════════════════════════════════════════════════════════
+
+  let bruttoGesamt = 0;
+
+  if (person.beschaeftigungsart === 'angestellt') {
+    // 3.1 Nichtselbständige (§2c)
+    bruttoGesamt = person.bruttoMonatlich.reduce((sum, m) => sum + m, 0);
+
+    // WICHTIG: Sonstige Bezüge abziehen! (§2c Abs. 1 Satz 2)
+    bruttoGesamt -= person.sonstigeBezuege; // Weihnachtsgeld, 13. Gehalt, etc.
+
+  } else if (person.beschaeftigungsart === 'selbstaendig') {
+    // 3.2 Selbständige (§2d)
+    if (person.steuerbescheidVorhanden) {
+      bruttoGesamt = person.gewinnLautSteuerbescheid;
+    } else {
+      // Schätzung mit Betriebsausgaben-Pauschale
+      const betriebsausgaben = Math.max(
+        person.tatsaechlicheBetriebsausgaben,
+        person.einnahmen * 0.25  // 25% Pauschale
+      );
+      bruttoGesamt = person.einnahmen - betriebsausgaben;
+    }
+
+  } else if (person.beschaeftigungsart === 'beamte') {
+    // 3.3 Beamte - keine Sozialabgaben!
+    bruttoGesamt = person.dienstbezuege * 12;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 4: ABZÜGE BERECHNEN (§2e, §2f)
+  // ═══════════════════════════════════════════════════════════
+
+  const monatsBrutto = bruttoGesamt / 12;
+
+  // 4.1 Arbeitnehmer-Pauschbetrag (nur bei Angestellten)
+  const anPauschbetrag = person.beschaeftigungsart === 'angestellt'
+    ? 102.50  // 1.230 € / 12
+    : 0;
+
+  const bemessungsgrundlage = monatsBrutto - anPauschbetrag;
+
+  // 4.2 Steuerabzüge (§2e)
+  // WICHTIG: Steuerklasse VI wird NICHT berücksichtigt!
+  const steuerklasse = person.steuerklasse === 6 ? 4 : person.steuerklasse;
+  const einkommensteuer = berechneLohnsteuer(bemessungsgrundlage, steuerklasse);
+  const soli = berechneSoli(einkommensteuer);
+  const kirchensteuer = person.kirchensteuerpflichtig
+    ? einkommensteuer * 0.08  // BEEG: einheitlich 8%, NICHT 9%!
+    : 0;
+
+  const steuerabzuege = einkommensteuer + soli + kirchensteuer;
+
+  // 4.3 Sozialabzüge (§2f) - BEEG-PAUSCHALEN verwenden!
+  let sozialabzuege = 0;
+
+  if (person.beschaeftigungsart !== 'beamte') {
+    // Kranken-/Pflegeversicherung
+    if (person.gkvVersichert) {
+      sozialabzuege += bemessungsgrundlage * 0.09;  // 9% NICHT 9,8%!
+    }
+    // Rentenversicherung
+    if (person.rvPflichtig) {
+      sozialabzuege += bemessungsgrundlage * 0.10;  // 10% NICHT 9,3%!
+    }
+    // Arbeitslosenversicherung
+    if (person.avPflichtig) {
+      sozialabzuege += bemessungsgrundlage * 0.02;  // 2% NICHT 1,3%!
+    }
+    // Bei voller SV-Pflicht: 21% Gesamt
+  }
+
+  // Sonderfall Midijob (§2f Abs. 2 Satz 3)
+  if (monatsBrutto > 538 && monatsBrutto <= 2000) {
+    sozialabzuege = berechneMidijobBeitraege(monatsBrutto);
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 5: NETTOEINKOMMEN VOR GEBURT
+  // ═══════════════════════════════════════════════════════════
+
+  const nettoVorGeburt = bemessungsgrundlage - steuerabzuege - sozialabzuege;
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 6: ERSATZRATE BESTIMMEN (§2 Abs. 1-2)
+  // ═══════════════════════════════════════════════════════════
+
+  let ersatzrate;
+
+  if (nettoVorGeburt < 1000) {
+    // Geringverdiener-Bonus: +0,1% pro 2€ unter 1000€
+    ersatzrate = 0.67 + (1000 - nettoVorGeburt) * 0.0005;
+    ersatzrate = Math.min(1.0, ersatzrate);  // Max 100%
+
+  } else if (nettoVorGeburt <= 1200) {
+    // Standard-Ersatzrate
+    ersatzrate = 0.67;
+
+  } else {
+    // Besserverdiener-Abschlag: -0,1% pro 2€ über 1200€
+    ersatzrate = 0.67 - (nettoVorGeburt - 1200) * 0.0005;
+    ersatzrate = Math.max(0.65, ersatzrate);  // Min 65%
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 7: BASISELTERNGELD BERECHNEN
+  // ═══════════════════════════════════════════════════════════
+
+  let basiselterngeld;
+
+  if (person.einkommenWaehrendBezug === 0) {
+    // 7.1 Ohne Einkommen während Bezug (§2 Abs. 1)
+    basiselterngeld = nettoVorGeburt * ersatzrate;
+
+  } else {
+    // 7.2 Mit Einkommen während Bezug (§2 Abs. 3)
+    // WICHTIG: Deckelung auf 2.770 €!
+    const nettoVorGedeckelt = Math.min(2770, nettoVorGeburt);
+    const differenz = nettoVorGedeckelt - person.einkommenWaehrendBezug;
+    basiselterngeld = Math.max(0, differenz) * ersatzrate;
+  }
+
+  // Mindest- und Höchstbeträge
+  basiselterngeld = Math.max(300, Math.min(1800, basiselterngeld));
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 8: ELTERNGELDPLUS BERECHNEN (§4a Abs. 2)
+  // ═══════════════════════════════════════════════════════════
+
+  // Basiselterngeld OHNE Einkommen (für Deckelung)
+  const basisOhneEinkommen = Math.min(1800, nettoVorGeburt * ersatzrate);
+  const maxElterngeldPlus = basisOhneEinkommen / 2;
+
+  // ElterngeldPlus = MIN(berechneter Betrag, halbes Basis ohne Einkommen)
+  let elterngeldPlus;
+  if (person.einkommenWaehrendBezug === 0) {
+    elterngeldPlus = basiselterngeld / 2;
+  } else {
+    elterngeldPlus = Math.min(basiselterngeld, maxElterngeldPlus);
+  }
+
+  // Mindest- und Höchstbeträge für Plus
+  elterngeldPlus = Math.max(150, Math.min(900, elterngeldPlus));
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 9: BONI HINZUFÜGEN (§2a)
+  // ═══════════════════════════════════════════════════════════
+
+  // 9.1 Geschwisterbonus (§2a Abs. 1-3)
+  let geschwisterbonus = 0;
+  if (hatGeschwisterbonus(person.kinder, geburtsdatum)) {
+    geschwisterbonus = Math.max(75, basiselterngeld * 0.10);
+  }
+
+  // 9.2 Mehrlingszuschlag (§2a Abs. 4)
+  const mehrlingszuschlag = (person.anzahlMehrlinge - 1) * 300;
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 10: ANRECHNUNGEN (§3)
+  // ═══════════════════════════════════════════════════════════
+
+  let anrechnung = 0;
+
+  // 10.1 Mutterschaftsgeld (§3 Abs. 1 Nr. 1) - VOLLE Anrechnung!
+  if (person.rolle === 'mutter' && person.mutterschaftsgeld > 0) {
+    anrechnung += person.mutterschaftsgeld;
+    anrechnung += person.arbeitgeberZuschuss;
+    // KEIN Sockelbetrag frei bei Mutterschaftsgeld!
+  }
+
+  // 10.2 Andere Lohnersatzleistungen (§3 Abs. 1 Nr. 5)
+  // 300€ Sockelbetrag bleibt frei (§3 Abs. 2)
+  if (person.andereLohnersatz > 0) {
+    const anrechenbarerTeil = Math.max(0, person.andereLohnersatz - 300);
+    anrechnung += anrechenbarerTeil;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // SCHRITT 11: ENDERGEBNIS
+  // ═══════════════════════════════════════════════════════════
+
+  const gesamtBasis = basiselterngeld + geschwisterbonus + mehrlingszuschlag;
+  const auszahlungBasis = Math.max(0, gesamtBasis - anrechnung);
+
+  const gesamtPlus = elterngeldPlus + (geschwisterbonus / 2) + (mehrlingszuschlag / 2);
+  const auszahlungPlus = Math.max(0, gesamtPlus - (anrechnung / 2));
+
+  return {
+    anspruch: true,
+    nettoVorGeburt,
+    ersatzrate,
+    basiselterngeld: {
+      grundbetrag: basiselterngeld,
+      geschwisterbonus,
+      mehrlingszuschlag,
+      anrechnung,
+      auszahlung: auszahlungBasis
+    },
+    elterngeldPlus: {
+      grundbetrag: elterngeldPlus,
+      geschwisterbonus: geschwisterbonus / 2,
+      mehrlingszuschlag: mehrlingszuschlag / 2,
+      anrechnung: anrechnung / 2,
+      auszahlung: auszahlungPlus
+    }
+  };
+}
+```
+
+### D.2 Hilfsfunktionen
+
+```javascript
+/**
+ * Einkommensgrenze nach Geburtsdatum (§1 Abs. 8, §28)
+ */
+function ermittleEinkommensgrenze(geburtsdatum) {
+  // Übergangsregelung §28 Abs. 5
+  if (geburtsdatum >= '2024-04-01' && geburtsdatum <= '2025-03-31') {
+    return 200000;  // 200.000 € für Geburten 01.04.2024 - 31.03.2025
+  }
+  return 175000;    // 175.000 € ab 01.04.2025
+}
+
+/**
+ * Geschwisterbonus-Prüfung (§2a Abs. 1-3)
+ */
+function hatGeschwisterbonus(kinder, geburtsdatum) {
+  const kinderUnter3 = kinder.filter(k =>
+    alterInJahren(k.geburtsdatum, geburtsdatum) < 3 && !k.mitBehinderung
+  );
+  const kinderUnter6 = kinder.filter(k =>
+    alterInJahren(k.geburtsdatum, geburtsdatum) < 6
+  );
+  const kinderUnter14MitBehinderung = kinder.filter(k =>
+    alterInJahren(k.geburtsdatum, geburtsdatum) < 14 && k.mitBehinderung
+  );
+
+  // 2 Kinder unter 3 Jahren ODER 3+ Kinder unter 6 Jahren
+  return (kinderUnter3.length >= 1) ||
+         (kinderUnter6.length >= 2) ||
+         (kinderUnter14MitBehinderung.length >= 1);
+}
+
+/**
+ * Frühgeburten-Zusatzmonate (§4 Abs. 5)
+ */
+function berechneZusatzmonateFruehgeburt(etDatum, tatsaechlicheGeburt) {
+  const wochenVorET = Math.floor(
+    (new Date(etDatum) - new Date(tatsaechlicheGeburt)) / (7 * 24 * 60 * 60 * 1000)
+  );
+
+  if (wochenVorET >= 16) return 4;
+  if (wochenVorET >= 12) return 3;
+  if (wochenVorET >= 8) return 2;
+  if (wochenVorET >= 6) return 1;
+  return 0;
+}
+
+/**
+ * Midijob-Beitragsberechnung (Übergangsbereich §2f Abs. 2 Satz 3)
+ */
+function berechneMidijobBeitraege(brutto) {
+  // Formel für Übergangsbereich (538,01 € - 2.000 €)
+  // Vereinfachte Näherung - exakte Berechnung nach §344 Abs. 4 SGB III
+  const faktor = 1.14 - (1462 / brutto) * 0.14;
+  const beitragspflichtigesEntgelt = brutto * faktor;
+  return beitragspflichtigesEntgelt * 0.21;  // Volle 21% auf reduziertes Entgelt
+}
+```
+
+---
+
+## Anhang E: Validierungsregeln
+
+### E.1 Anspruchsvalidierung
+
+| Prüfung | Bedingung | Aktion bei Verletzung |
+|---------|-----------|----------------------|
+| Einkommensgrenze | zvE ≤ 175.000 € (bzw. 200.000 € Übergang) | Kein Anspruch |
+| Wohnsitz | Deutschland oder DE-SV-Recht | Kein Anspruch |
+| Arbeitszeit | ≤ 32h/Woche im Durchschnitt | Kein Anspruch für diesen Monat |
+| Mindestbezug | ≥ 2 Lebensmonate | Warnung |
+
+### E.2 Bezugsdauer-Validierung
+
+| Prüfung | Bedingung | Aktion bei Verletzung |
+|---------|-----------|----------------------|
+| Max. Basis pro Person | ≤ 12 Monate | Kürzen auf 12 |
+| Gleichzeitiger Basis-Bezug | Max. 1 Monat (außer Ausnahmen) | Warnung |
+| Partnermonate | Mind. 2 Monate mit Einkommensminderung | Partnermonate nicht verfügbar |
+| Partnerschaftsbonus | Beide 24-32h/Woche gleichzeitig | Bonus nicht verfügbar |
+
+### E.3 Datenvalidierung
+
+| Feld | Validierung | Fehlermeldung |
+|------|-------------|---------------|
+| Brutto | > 0 | "Bruttogehalt muss größer 0 sein" |
+| Steuerklasse | 1-5 (nicht 6 für Berechnung) | "Steuerklasse VI wird nicht berücksichtigt" |
+| Steuerklassenwechsel | ≥ 7 Monate vor Bemessungsende | "Wechsel zu spät für Berücksichtigung" |
+| Teilzeit-Stunden | ≤ 32 | "Max. 32h für Elterngeld-Anspruch" |
+
+---
+
+## Anhang F: Test-Cases
+
+### F.1 Ersatzrate-Tests
+
+```javascript
+// Test 1: Geringverdiener
+assert(berechneErsatzrate(800) === 0.77);   // 67% + 10% = 77%
+assert(berechneErsatzrate(600) === 0.87);   // 67% + 20% = 87%
+assert(berechneErsatzrate(340) === 1.00);   // 67% + 33% = 100% (Max)
+
+// Test 2: Normalverdiener
+assert(berechneErsatzrate(1000) === 0.67);
+assert(berechneErsatzrate(1100) === 0.67);
+assert(berechneErsatzrate(1200) === 0.67);
+
+// Test 3: Besserverdiener
+assert(berechneErsatzrate(1400) === 0.66);  // 67% - 1% = 66%
+assert(berechneErsatzrate(1600) === 0.65);  // 67% - 2% = 65% (Min)
+assert(berechneErsatzrate(3000) === 0.65);  // Min greift
+```
+
+### F.2 Elterngeld-Berechnungstests
+
+```javascript
+// Test 1: Standard-Angestellte ohne Teilzeit
+const result1 = berechneElterngeld({
+  bruttoMonatlich: Array(12).fill(3500),
+  sonstigeBezuege: 0,
+  steuerklasse: 4,
+  kirchensteuerpflichtig: true,
+  gkvVersichert: true,
+  rvPflichtig: true,
+  avPflichtig: true,
+  einkommenWaehrendBezug: 0
+});
+// Erwartet: Netto ca. 2.200 €, Rate 65%, Basis ca. 1.430 €
+assert(result1.nettoVorGeburt > 2100 && result1.nettoVorGeburt < 2300);
+assert(result1.ersatzrate === 0.65);
+assert(result1.basiselterngeld.grundbetrag > 1400);
+
+// Test 2: Mit Teilzeit (Deckelung 2.770 €)
+const result2 = berechneElterngeld({
+  // ... gleiche Daten ...
+  einkommenWaehrendBezug: 1500
+});
+// Netto gedeckelt auf 2.770 €, Differenz = 2.770 - 1.500 = 1.270 €
+// Elterngeld = 1.270 × 65% = 825,50 €
+assert(result2.basiselterngeld.grundbetrag < result1.basiselterngeld.grundbetrag);
+
+// Test 3: Mindestbetrag
+const result3 = berechneElterngeld({
+  bruttoMonatlich: Array(12).fill(0),
+  einkommenWaehrendBezug: 0
+});
+assert(result3.basiselterngeld.grundbetrag === 300);  // Mindestbetrag
+assert(result3.elterngeldPlus.grundbetrag === 150);   // Mindestbetrag Plus
+
+// Test 4: Höchstbetrag
+const result4 = berechneElterngeld({
+  bruttoMonatlich: Array(12).fill(8000),
+  einkommenWaehrendBezug: 0
+});
+assert(result4.basiselterngeld.grundbetrag === 1800); // Höchstbetrag
+assert(result4.elterngeldPlus.grundbetrag === 900);   // Höchstbetrag Plus
+
+// Test 5: Beamte (keine Sozialabgaben)
+const result5 = berechneElterngeld({
+  beschaeftigungsart: 'beamte',
+  dienstbezuege: 4000,
+  steuerklasse: 3,
+  einkommenWaehrendBezug: 0
+});
+// Höheres Netto als Angestellte mit gleichem Brutto!
+assert(result5.nettoVorGeburt > result1.nettoVorGeburt);
+```
+
+### F.3 Anrechnungstests
+
+```javascript
+// Test: Mutterschaftsgeld-Anrechnung
+const result6 = berechneElterngeld({
+  rolle: 'mutter',
+  mutterschaftsgeld: 390,      // 13 €/Tag × 30
+  arbeitgeberZuschuss: 2110,   // Differenz zum Netto
+  // ...
+});
+// Mutterschaftsgeld = 390 + 2.110 = 2.500 €
+// Elterngeld ca. 1.500 € → Auszahlung = 0 € (komplett angerechnet!)
+assert(result6.basiselterngeld.auszahlung === 0);
+```
+
+### F.4 Frühgeburten-Tests
+
+```javascript
+assert(berechneZusatzmonateFruehgeburt('2025-06-01', '2025-04-20') === 1); // 6 Wochen
+assert(berechneZusatzmonateFruehgeburt('2025-06-01', '2025-04-06') === 2); // 8 Wochen
+assert(berechneZusatzmonateFruehgeburt('2025-06-01', '2025-03-09') === 3); // 12 Wochen
+assert(berechneZusatzmonateFruehgeburt('2025-06-01', '2025-02-09') === 4); // 16 Wochen
+```
+
+---
+
+## Anhang G: Backend-Fehler und Korrekturen
+
+### G.1 Identifizierte Fehler im aktuellen Backend
+
+| Fehler | IST (Backend) | SOLL (BEEG) | Auswirkung |
+|--------|---------------|-------------|------------|
+| Ersatzrate-Grenze | > 1.240 € Absenkung | > 1.200 € Absenkung | Falsches Elterngeld |
+| Ersatzrate 1000-1200 | Erhöhung (falsch!) | Konstant 67% | Zu hohes Elterngeld |
+| Sozialabgaben gesamt | 20,4% | 21% | Zu hohes Netto, zu hohes EG |
+| KV/PV-Pauschale | 9,8% | 9% | Zu niedrige Abzüge |
+| RV-Pauschale | 9,3% | 10% | Zu niedrige Abzüge |
+| AV-Pauschale | 1,3% | 2% | Zu niedrige Abzüge |
+| Kirchensteuer | 9% | 8% | Zu hohe Abzüge |
+| Deckelung 2.770 € | Fehlt | Bei Teilzeit anwenden | Falsches Elterngeld bei Teilzeit |
+| Einkommensgrenze | Fehlt | 175.000 € prüfen | Kein Ausschluss |
+| Mutterschaftsgeld | Fehlt | Voll anrechnen | Zu hohe Auszahlung |
+
+### G.2 Korrektur-Anweisungen
+
+```javascript
+// KORREKTUR 1: Ersatzrate
+// FALSCH:
+if (netto > 1240) rate = 0.67 - (netto - 1240) * 0.0005;
+// RICHTIG:
+if (netto > 1200) rate = 0.67 - (netto - 1200) * 0.0005;
+
+// KORREKTUR 2: Ersatzrate 1000-1200
+// FALSCH: Erhöhung berechnen
+// RICHTIG: Konstant 67%
+if (netto >= 1000 && netto <= 1200) rate = 0.67;
+
+// KORREKTUR 3: Sozialabgaben
+// FALSCH:
+const sv = brutto * 0.204;  // 20,4%
+// RICHTIG:
+const sv = brutto * 0.21;   // 21% (9% KV/PV + 10% RV + 2% AV)
+
+// KORREKTUR 4: Kirchensteuer
+// FALSCH:
+const kist = lst * 0.09;  // 9%
+// RICHTIG:
+const kist = lst * 0.08;  // 8% (BEEG einheitlich!)
+
+// KORREKTUR 5: Deckelung bei Teilzeit
+// FEHLT - HINZUFÜGEN:
+if (einkommenWaehrendBezug > 0) {
+  nettoVorGeburt = Math.min(2770, nettoVorGeburt);
+}
+```
 
 ---
 

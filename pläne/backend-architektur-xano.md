@@ -3542,7 +3542,7 @@ Nach Implementierung:
 
 4. **BEEG-Berechnung validieren:**
    - 3.000 EUR Brutto → ~2.100 EUR Elterngeld-Netto
-   - Ersatzrate: 65% (über 1.240)
+   - Ersatzrate: 65% (über 1.200 EUR gemäß §2 Abs. 2 BEEG)
    - Basiselterngeld: ~1.365 EUR/Monat
 
 ---
